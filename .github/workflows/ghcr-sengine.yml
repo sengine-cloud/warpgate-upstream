@@ -1,0 +1,110 @@
+# Builds this fork's Warpgate image for the nur1 bastion (arm64).
+#
+# The sengine branch is upstream v0.29.2 plus one fix: the Kubernetes target
+# resends a request when the connection to the API server fails to come up
+# (TCP connect or TLS handshake). Rackspace Spot's API front end is
+# ingress-nginx in SSL passthrough mode, which intermittently routes a
+# ClientHello that spans two TCP segments to its fake default certificate
+# (kubernetes/ingress-nginx#11491); about 1% of bastion kubectl calls failed
+# with "outbound HTTP request failed". Drop this fork once an upstream release
+# carries the fix.
+#
+# workflow_dispatch only, deliberately: this is a PUBLIC fork, so nothing here
+# may run on an event an outside contributor can trigger. The inherited
+# upstream workflows are deleted on this branch for the same reason (docker.yml
+# would otherwise push to this repo's package on every push and nightly).
+#
+# GitHub-hosted runners: public repos cannot reach the shared ARC pool, and
+# ubuntu-24.04-arm builds arm64 natively for free on a public repo.
+name: ghcr-image (sengine)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (defaults to this branch)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  DOCKER_BUILD_SUMMARY: "false" # buildx otherwise uploads a *.dockerbuild artifact per run
+  IMAGE: ghcr.io/sengine-cloud/warpgate
+  UPSTREAM_TAG: v0.29.2
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      # The crate the fix lives in, so an image is never pushed from a tree
+      # whose tests fail. rust-toolchain.toml pins the nightly; rustup fetches it.
+      - name: Test warpgate-protocol-kubernetes
+        run: cargo test -p warpgate-protocol-kubernetes --lib
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      # The Dockerfile copies .git so `warpgate version` comes from git describe.
+      # The fork carries no tags (pushing v* tags here would fire upstream's
+      # release workflow), so fetch the base tag from upstream.
+      - name: Fetch the upstream base tag
+        run: |
+          git fetch --no-tags https://github.com/warp-tech/warpgate.git \
+            "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          echo "version=$(git describe --tags --always --dirty=-modified)" >> "$GITHUB_OUTPUT"
+        id: version
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No :latest. nur1 pins the image by digest in docker-composes, and a
+      # floating tag on a fork invites exactly the drift the pin exists to stop.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=sengine-arm64
+          cache-to: type=gha,scope=sengine-arm64,mode=max
+          # Upstream turns these off too: the attestation adds an
+          # unknown/unknown platform entry (warp-tech/warpgate#1255).
+          provenance: false
+          sbom: false
+
+      - name: Report the digest to pin
+        run: |
+          {
+            echo "### Image pushed"
+            echo '```'
+            echo "${IMAGE}:${{ steps.version.outputs.version }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
