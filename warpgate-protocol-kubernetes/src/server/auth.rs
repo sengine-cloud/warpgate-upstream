@@ -454,6 +454,13 @@ pub async fn create_authenticated_client(
     // Create HTTP client with the configuration
     let mut client_builder = reqwest::Client::builder();
 
+    if let Some(host) = url::Url::parse(&k8s_options.cluster_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        client_builder = client_builder.retry(upstream_retry_policy(host));
+    }
+
     if !k8s_options.tls.verify {
         client_builder = client_builder.danger_accept_invalid_certs(true);
     }
@@ -508,6 +515,40 @@ pub async fn create_authenticated_client(
     }
 
     Ok(client_builder)
+}
+
+/// Retry policy for requests to the Kubernetes API server.
+///
+/// Keeps reqwest's default (resend after a graceful GOAWAY or REFUSED_STREAM)
+/// and adds connections that failed to come up: TCP connect or TLS handshake.
+/// Nothing has been sent at that point, so resending is safe for any method.
+/// SNI-routing front ends can miss a ClientHello that spans two TCP segments
+/// and answer with their default certificate (kubernetes/ingress-nginx#11491),
+/// and a ClientHello with a post-quantum key share is big enough to do that.
+fn upstream_retry_policy(host: String) -> reqwest::retry::Builder {
+    reqwest::retry::for_host(host).classify_fn(|req_rep| match req_rep.error() {
+        Some(error) if is_safe_to_resend(error) => req_rep.retryable(),
+        _ => req_rep.success(),
+    })
+}
+
+fn is_safe_to_resend(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_connect)
+    {
+        return true;
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<h2::Error>() {
+            return error.is_remote()
+                && ((error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
+                    || (error.is_reset() && error.reason() == Some(h2::Reason::REFUSED_STREAM)));
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// True if `now` falls within the certificate's `[not_before, not_after]`
@@ -610,4 +651,52 @@ fn normalize_certificate_pem(pem: &str) -> String {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::net::TcpListener;
+
+    use super::upstream_retry_policy;
+
+    /// Accepts connections and closes them straight away, so every TLS
+    /// handshake fails. Returns a URL on it and a count of accepted connections.
+    async fn closing_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/version", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (url, accepted)
+    }
+
+    async fn attempts(client: reqwest::Client) -> usize {
+        let (url, accepted) = closing_server().await;
+        let error = client.get(&url).send().await.unwrap_err();
+        assert!(error.is_connect(), "{error:?}");
+        accepted.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn failed_handshakes_are_resent() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let client = reqwest::Client::builder()
+            .retry(upstream_retry_policy("127.0.0.1".into()))
+            .build()
+            .unwrap();
+        // The first attempt and two resends.
+        assert_eq!(attempts(client).await, 3);
+
+        let client = reqwest::Client::builder().build().unwrap();
+        assert_eq!(attempts(client).await, 1);
+    }
 }
